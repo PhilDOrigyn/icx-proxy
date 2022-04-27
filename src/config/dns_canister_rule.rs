@@ -50,6 +50,18 @@ impl DnsCanisterRule {
     }
 
     /// Return the associated principal if this rule applies to the domain name.
+    pub fn lookup_name(&self, name_lowercase: &str) -> Option<Principal> {
+        if name_lowercase == &self.domain_name {
+            match &self.strategy {
+                PrincipalDeterminationStrategy::Alias(principal) => Some(*principal),
+                PrincipalDeterminationStrategy::PrecedingDomainName => None,
+            }
+        } else {
+            None
+        }
+    }
+
+    /// Return the associated principal if this rule applies to the domain name.
     pub fn lookup(&self, split_hostname_lowercase: &[String]) -> Option<Principal> {
         if split_hostname_lowercase.ends_with(&self.dns_suffix) {
             match &self.strategy {

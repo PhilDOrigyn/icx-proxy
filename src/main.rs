@@ -138,45 +138,77 @@ fn resolve_canister_id_from_hostname(
     }
 }
 
-fn resolve_canister_id_from_uri(url: &hyper::Uri) -> Option<Principal> {
-    let (_, canister_id) = url::form_urlencoded::parse(url.query()?.as_bytes())
-        .find(|(name, _)| name == "canisterId")?;
-    Principal::from_text(canister_id.as_ref()).ok()
+fn resolve_canister_id_from_uri(
+    url: &hyper::Uri,
+    dns_canister_config: &DnsCanisterConfig,
+    //canister_list: &[(String, Principal)],
+) -> Option<(Principal, String)> {
+    //    let (_, canister_id) = url::form_urlencoded::parse(url.query()?.as_bytes())
+    //        .find(|(name, _)| name == "canisterId")?;
+    //    Principal::from_text(canister_id.as_ref()).ok()
+
+    let mut segment = path_segments(url)?;
+    if let Some("-") = segment.next() {
+        let x = segment.next()?;
+        //detect if it's a canister id
+        let id = Principal::from_text(x)
+            .ok()
+            .or_else(|| dns_canister_config.resolve_canister_id_from_name(x))?;
+
+        if let Some("-") = segment.next() {
+            let y = segment.next()?;
+            return Some((id, y.to_string()));
+        }
+    }
+    None
 }
 
-/// Try to resolve a canister ID from an HTTP Request. If it cannot be resolved,
+pub fn path_segments(url: &hyper::Uri) -> Option<std::str::Split<'_, char>> {
+    let path = url.path();
+    if path.starts_with('/') {
+        Some(path[1..].split('/'))
+    } else {
+        None
+    }
+}
+
+/// Try to resolve a (canister ID, uri) from an HTTP Request. If it cannot be resolved,
 /// [None] will be returned.
 fn resolve_canister_id(
     request: &Request<Body>,
     dns_canister_config: &DnsCanisterConfig,
-) -> Option<Principal> {
+) -> (Option<Principal>, Option<String>) {
     // Look for subdomains if there's a host header.
     if let Some(host_header) = request.headers().get("Host") {
         if let Ok(host) = host_header.to_str() {
             if let Some(canister_id) = resolve_canister_id_from_hostname(host, dns_canister_config)
             {
-                return Some(canister_id);
+                return (Some(canister_id), None);
             }
         }
     }
 
     // Look into the URI.
-    if let Some(canister_id) = resolve_canister_id_from_uri(request.uri()) {
-        return Some(canister_id);
+    if let Some((canister_id, uri)) =
+        resolve_canister_id_from_uri(request.uri(), dns_canister_config)
+    {
+        return (Some(canister_id), Some(uri));
     }
 
     // Look into the request by header.
     if let Some(referer_header) = request.headers().get("referer") {
         if let Ok(referer) = referer_header.to_str() {
             if let Ok(referer_uri) = hyper::Uri::from_str(referer) {
-                if let Some(canister_id) = resolve_canister_id_from_uri(&referer_uri) {
-                    return Some(canister_id);
+                if let Some((canister_id, _)) =
+                    resolve_canister_id_from_uri(&referer_uri, dns_canister_config)
+                {
+                    return (Some(canister_id), None);
                 }
             }
         }
     }
 
-    None
+    (None, None)
 }
 
 fn decode_hash_tree(
@@ -274,14 +306,15 @@ async fn forward_request(
     dns_canister_config: &DnsCanisterConfig,
     logger: slog::Logger,
 ) -> Result<Response<Body>, Box<dyn Error>> {
-    let canister_id = match resolve_canister_id(&request, dns_canister_config) {
-        None => {
+    let (canister_id, found_uri) = match resolve_canister_id(&request, dns_canister_config) {
+        (None, _) => {
             return Ok(Response::builder()
                 .status(StatusCode::BAD_REQUEST)
                 .body("Could not find a canister id to forward to.".into())
                 .unwrap())
         }
-        Some(x) => x,
+        (Some(x), None) => (x, None),
+        (Some(x), Some(y)) => (x, Some(y)),
     };
 
     slog::trace!(
@@ -293,8 +326,10 @@ async fn forward_request(
     );
 
     let (parts, body) = request.into_parts();
+    let uri = found_uri
+        .map(|u| format!("/-/{}", u))
+        .unwrap_or_else(|| parts.uri.to_string());
     let method = parts.method;
-    let uri = parts.uri.to_string();
     let headers = parts
         .headers
         .iter()
@@ -867,4 +902,52 @@ fn main() -> Result<(), Box<dyn Error>> {
         server.await?;
         Ok(())
     })
+}
+
+#[cfg(test)]
+mod test {
+    use super::resolve_canister_id_from_uri;
+    use crate::config::dns_canister_config::DnsCanisterConfig;
+    use hyper::http::Uri;
+    #[test]
+    fn test_resolve_canister_id_from_uri() {
+        let dns_aliases = ["uefa_nfts4g:r5m5i-tiaaa-aaaaj-acgaq-cai".to_string()];
+        let config = DnsCanisterConfig::new(&dns_aliases, &[]).unwrap();
+        let uri = "/-/uefa_nfts4g/-/uefa_nfts4g_0".parse::<Uri>().unwrap();
+        let res = resolve_canister_id_from_uri(&uri, &config);
+        //        println!("res:{:?}", res);
+        let (canister_id, uri) = res.unwrap();
+        assert_eq!("uefa_nfts4g_0", uri);
+        assert_eq!("r5m5i-tiaaa-aaaaj-acgaq-cai", canister_id.to_string());
+        let uri = "/-/r5m5i-tiaaa-aaaaj-acgaq-cai/-/uefa_nfts4g_0"
+            .parse::<Uri>()
+            .unwrap();
+        let res = resolve_canister_id_from_uri(&uri, &config);
+        //        println!("res:{:?}", res);
+        let (canister_id, uri) = res.unwrap();
+        assert_eq!("uefa_nfts4g_0", uri);
+        assert_eq!("r5m5i-tiaaa-aaaaj-acgaq-cai", canister_id.to_string());
+
+        //https://nft.origyn.network/x/-/y => Error
+        let uri = "/uefa_nfts4g/-/uefa_nfts4g_0".parse::<Uri>().unwrap();
+        let res = resolve_canister_id_from_uri(&uri, &config);
+        assert!(res.is_none());
+        //https://nft.origyn.network/-/x/y => Error
+        let uri = "/-/uefa_nfts4g/uefa_nfts4g_0".parse::<Uri>().unwrap();
+        let res = resolve_canister_id_from_uri(&uri, &config);
+        assert!(res.is_none());
+        //uefa_nfts3g can't be converted to a canister_id
+        let uri = "/-/uefa_nfts3g/-/uefa_nfts4g_0".parse::<Uri>().unwrap();
+        let res = resolve_canister_id_from_uri(&uri, &config);
+        assert!(res.is_none());
+
+        //https://nft.origyn.network/x/y => Error
+        let uri = "/uefa_nfts4g/uefa_nfts4g_0".parse::<Uri>().unwrap();
+        let res = resolve_canister_id_from_uri(&uri, &config);
+        assert!(res.is_none());
+        //https://nft.origyn.network/-/x => Error
+        let uri = "/-/uefa_nfts4g".parse::<Uri>().unwrap();
+        let res = resolve_canister_id_from_uri(&uri, &config);
+        assert!(res.is_none());
+    }
 }

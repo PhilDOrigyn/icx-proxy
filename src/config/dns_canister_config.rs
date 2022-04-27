@@ -29,6 +29,17 @@ impl DnsCanisterConfig {
         Ok(DnsCanisterConfig { rules })
     }
 
+    /// Return the Principal of the canister that domain name matches the name.
+    ///
+    /// the specified name is expected to be the domain name of the DnsCanisterRule,
+    /// but may contain upper- or lower-case characters.
+    pub fn resolve_canister_id_from_name(&self, name: &str) -> Option<Principal> {
+        let name_lowercase = name.to_ascii_lowercase();
+        self.rules
+            .iter()
+            .find_map(|rule| rule.lookup_name(&name_lowercase))
+    }
+
     /// Return the Principal of the canister that matches the host name.
     ///
     /// split_hostname is expected to be the hostname split by '.',
